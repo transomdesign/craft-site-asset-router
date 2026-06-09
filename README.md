@@ -1,15 +1,15 @@
 # Site Asset Router
 
-A Craft CMS 5 plugin for multi-site installations that automatically organizes assets into site-specific subfolders and scopes the CP asset browser to the active site.
+A Craft CMS 5 plugin for multi-site installations that organizes assets into site-specific subfolders and scopes the CP asset browser to the active site.
 
-## What It Does
+## What it does
 
 In a multisite Craft installation where all sites share the same asset volumes, uploads from different sites end up mixed together. Site Asset Router solves this by:
 
-1. **Upload routing** — New uploads are automatically placed in `{siteHandle}/{volumeHandle}/` subfolders within each volume.
-2. **Asset browser filtering** — The CP asset browser shows only the active site's assets per volume, so editors never see another site's files.
+1. **Upload routing:** New uploads are placed in `{siteHandle}/{volumeHandle}/` subfolders within each volume.
+2. **Asset browser filtering:** The CP asset browser shows only the active site's assets per volume, so editors never see another site's files.
 
-### Folder Structure
+### Folder structure
 
 Given three sites (`brandA`, `brandB`, `brandC`) and a volume called `images`, uploads are organized as:
 
@@ -20,7 +20,7 @@ images/                        (volume root on filesystem)
   brandC/images/               uploads from Brand C
 ```
 
-Subfolders are created automatically on first upload — no manual setup required.
+Subfolders are created on first upload. No manual setup required.
 
 ## Requirements
 
@@ -52,7 +52,7 @@ Create or edit `config/site-asset-router.php`:
 
 return [
     // Volume handles to exclude from site-based routing.
-    // Excluded volumes keep their default behavior — uploads go to
+    // Excluded volumes keep their default behavior; uploads go to
     // whatever location the field or asset browser specifies, and the
     // asset browser shows all folders without filtering.
     'excludedVolumes' => ['fonts', 'favicons', 'icons'],
@@ -67,22 +67,22 @@ return [
 
 Volumes that contain shared/global assets (fonts, favicons, icons) should typically be excluded since they don't need per-site separation.
 
-## How It Works
+## How it works
 
-### Upload Routing
+### Upload routing
 
 The plugin listens to `Asset::EVENT_BEFORE_SAVE` and intercepts new uploads:
 
 1. **Resolves the target volume** from the asset's folder, body params, or by parsing `Asset::newLocation` (which `Asset::beforeSave()` sets before the event fires).
-2. **Checks for exclusion** — if the volume is in `excludedVolumes`, the upload proceeds normally.
-3. **Checks for existing site path** — if the upload already targets a site subfolder (e.g., the asset browser was filtered), it skips re-routing to avoid double-nesting.
+2. **Checks for exclusion:** if the volume is in `excludedVolumes`, the upload proceeds normally.
+3. **Checks for an existing site path:** if the upload already targets a site subfolder (e.g., the asset browser was filtered), it skips re-routing to avoid double-nesting.
 4. **Resolves the active site** using this priority:
-   - `Cp::requestedSite()` — the site shown in the CP header (works for AJAX uploads via session)
-   - `siteId` body param — sent by entry editors when uploading from asset fields
-   - `getCurrentSite()` — last resort fallback
+   - `Cp::requestedSite()`: the site shown in the CP header, also covers AJAX uploads
+   - `siteId` body param: sent by entry editors when uploading from an asset field
+   - `getCurrentSite()`: last resort
 5. **Routes the upload** to `{siteHandle}/{volumeHandle}/` within the volume, creating the subfolder if needed.
 
-### Asset Browser Filtering
+### Asset browser filtering
 
 The plugin listens to `Asset::EVENT_REGISTER_SOURCES` and rewrites volume sources:
 
@@ -90,9 +90,9 @@ The plugin listens to `Asset::EVENT_REGISTER_SOURCES` and rewrites volume source
 2. It ensures a `{siteHandle}/{volumeHandle}/` subfolder record exists in the database.
 3. It rewrites the source's `criteria.folderId` and `data.folder-id` to point at that subfolder.
 
-The result: clicking "Images" in the asset sidebar shows only `brandA/images/` contents when Brand A is the active site. Switching sites in the CP header updates the view automatically.
+Clicking "Images" in the asset sidebar shows only `brandA/images/` contents when Brand A is the active site. Switching sites in the CP header updates the view automatically.
 
-### Safety Guards
+### Safety guards
 
 | Scenario | Behavior |
 |----------|----------|
@@ -103,9 +103,9 @@ The result: clicking "Images" in the asset sidebar shows only `brandA/images/` c
 | Settings context (volume config screens) | Filtering skipped |
 | Null site (no CP context) | Routing and filtering both skipped |
 
-## Asset Field Configuration
+## Asset field configuration
 
-Once the plugin is active, you can **remove** any manual `{ object.site.handle }/volumeName` values from your Asset fields' "Asset Location" settings. The plugin handles path routing automatically for all upload sources:
+Once the plugin is active, you can **remove** any manual `{ object.site.handle }/volumeName` values from your Asset fields' "Asset Location" settings. The plugin handles path routing for all upload sources:
 
 - Drag-and-drop into the asset browser
 - The "Upload files" button in the asset browser
@@ -121,20 +121,20 @@ The plugin logs routing decisions to a dedicated `site-asset-router` log channel
 
 Check `storage/logs/site-asset-router-*.log` for routing activity.
 
-## Running Tests
+## Running tests
 
 ```bash
 cd plugins/site-asset-router
 php ../../vendor/bin/phpunit
 ```
 
-## Known Limitations
+## Known limitations
 
 - **CLI uploads are not routed.** Assets created via console commands or queue jobs bypass routing because there is no CP site context. These assets land wherever Craft's default logic places them.
 - **Existing assets are not migrated.** Installing the plugin does not move previously uploaded assets into site subfolders. Only new uploads are routed.
 - **No per-field routing.** All non-excluded volumes use the same `{siteHandle}/{volumeHandle}/` pattern. There is no way to configure different subfolder structures per field.
 
-## File Structure
+## File structure
 
 ```
 src/
