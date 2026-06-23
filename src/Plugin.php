@@ -11,6 +11,7 @@ use craft\elements\Asset;
 use craft\events\ModelEvent;
 use craft\models\Site;
 use craft\events\RegisterElementSourcesEvent;
+use craft\helpers\Assets as AssetsHelper;
 use craft\helpers\Cp;
 use craft\log\MonologTarget;
 use Monolog\Formatter\LineFormatter;
@@ -95,52 +96,38 @@ class Plugin extends BasePlugin
         return Cp::requestedSite();
     }
 
+    /**
+     * Route an asset save to its `{siteHandle}/{volumeHandle}/` subfolder.
+     *
+     * Fires for every Asset::EVENT_BEFORE_SAVE. It acts only when the save is a
+     * real MOVE/UPLOAD whose target folder is NOT already site-prefixed — which
+     * covers three cases the old `!$isNew` + console guards used to miss:
+     *   - new uploads (CP / entry-field),
+     *   - Craft's AssetsField restricted-location enforcement, which moves
+     *     related assets to the volume root on canonical entry save
+     *     (`isNew = false`), and
+     *   - the same move happening in a console/queue context (migrations).
+     *
+     * @param bool $isNew Retained for signature stability / callers; routing is
+     *                    now driven by the move target, not the new flag.
+     */
     private function _routeAssetUpload(Asset $asset, bool $isNew, ?Site $cpSite = null): void
     {
-        // ROUT-04: Only route new uploads
-        if (!$isNew) {
-            return;
-        }
-
-        // Console guard — no site context in CLI/queue
-        if (Craft::$app->getRequest()->getIsConsoleRequest()) {
-            return;
-        }
-
         $request = Craft::$app->getRequest();
         $assetsService = Craft::$app->getAssets();
 
-        // Resolve the asset's target folder.
-        // Asset::beforeSave() consumes newFolderId into newLocation and nulls
-        // both newFolderId and (for new assets) leaves folderId unset. The most
-        // reliable source is therefore newLocation, which is always set by the
-        // time EVENT_BEFORE_SAVE fires.
-        $resolvedFolderId = $asset->folderId ?? $asset->newFolderId;
-
-        if (!$resolvedFolderId) {
-            $bodyFolderId = $request->getBodyParam('folderId');
-            if ($bodyFolderId) {
-                $resolvedFolderId = (int)$bodyFolderId;
-            }
-        }
-
-        // Fallback: parse folder ID from newLocation (set by Asset::beforeSave())
-        if (!$resolvedFolderId && $asset->newLocation) {
-            if (preg_match('/^\{folder:(\d+)\}/', $asset->newLocation, $m)) {
-                $resolvedFolderId = (int)$m[1];
-            }
-        }
-
-        $folder = $resolvedFolderId
-            ? $assetsService->getFolderById($resolvedFolderId)
-            : null;
-
-        if (!$folder) {
+        // Determine the TARGET folder of this save. No target => not a move => no-op.
+        $targetFolderId = $this->_targetFolderId($asset);
+        if (!$targetFolderId) {
             return;
         }
 
-        $volume = $folder->getVolume();
+        $targetFolder = $assetsService->getFolderById($targetFolderId);
+        if (!$targetFolder) {
+            return;
+        }
 
+        $volume = $targetFolder->getVolume();
         if (!$volume) {
             return;
         }
@@ -152,46 +139,115 @@ class Plugin extends BasePlugin
             return;
         }
 
-        // If the upload already targets a site-specific subfolder (e.g. the
-        // asset browser source was rewritten by FilterService), skip re-routing.
-        $folderPath = trim($folder->path ?? '', '/');
-        if ($folderPath !== '') {
-            $topSegment = explode('/', $folderPath)[0];
-            $allSiteHandles = array_map(
-                fn($s) => $s->handle,
-                Craft::$app->getSites()->getAllSites()
-            );
-            if (in_array($topSegment, $allSiteHandles, true)) {
-                return;
-            }
+        // Loop safety: the target is already under a known site handle — leave it
+        // (prevents double-nesting and re-entrancy when our own rewrite re-saves).
+        if ($this->_siteFromFolderPath($targetFolder->path) !== null) {
+            return;
         }
 
-        // ROUT-02: _resolveRequestedSite() already checked ?site= and siteId body param;
-        // fall through to getCurrentSite() only as a last resort (e.g. queue jobs).
-        $site = $cpSite ?? Craft::$app->getSites()->getCurrentSite();
-
-        if (!$site) {
+        // Site-resolution cascade:
+        //   1. Preserve the asset's current site: if it already lives under
+        //      {site}/..., re-anchor the move back into that site's subfolder.
+        //      This catches restrictLocation-driven moves to the volume root and
+        //      needs no request context, so it works in console/queue/migration.
+        //   2. The CP-requested site (new uploads from an entry editor/browser).
+        //   3. getCurrentSite() as a last resort — WEB requests only, so a
+        //      queue/console move is never misfiled into the primary site.
+        $sourceFolder = $asset->folderId ? $assetsService->getFolderById($asset->folderId) : null;
+        $site = $this->_siteFromFolderPath($sourceFolder?->path);
+        $site ??= $cpSite;
+        if ($site === null && !$request->getIsConsoleRequest()) {
+            $site = Craft::$app->getSites()->getCurrentSite();
+        }
+        if ($site === null) {
             return;
         }
 
         // AUTO-01/AUTO-02: Find or create the site/volume subfolder (physical dir + DB record)
-        $siteHandle = $site->handle;
-        $subPath = $siteHandle . '/' . $volume->handle;
-        $targetFolder = $assetsService->ensureFolderByFullPathAndVolume(
-            $subPath,
-            $volume,
-            false
-        );
+        $subPath = $site->handle . '/' . $volume->handle;
+        $destFolder = $assetsService->ensureFolderByFullPathAndVolume($subPath, $volume, false);
 
-        // ROUT-01/ROUT-03: Route the upload to the site/volume subfolder
-        // Set newLocation directly — Asset::beforeSave() already consumed
-        // newFolderId into newLocation before EVENT_BEFORE_SAVE fires
-        $asset->newLocation = "{folder:{$targetFolder->id}}{$asset->getFilename()}";
+        // Already heading there — nothing to rewrite.
+        if ($destFolder->id === $targetFolderId) {
+            return;
+        }
 
-        Craft::info(
-            "Routed \"{$asset->filename}\" → \"{$subPath}/\" in \"{$volume->handle}\".",
-            'site-asset-router'
-        );
+        // ROUT-01/ROUT-03: Re-anchor the save to the site/volume subfolder.
+        // Setting newLocation here does not re-trigger beforeSave; it's read once
+        // in Asset::_relocateFile() during afterSave.
+        $asset->newLocation = "{folder:{$destFolder->id}}{$asset->getFilename()}";
+
+        $sourcePath = trim($sourceFolder?->path ?? '', '/');
+        if ($sourcePath !== '') {
+            Craft::info(
+                "Re-anchored \"{$asset->filename}\" from \"{$sourcePath}/\" → \"{$subPath}/\" in \"{$volume->handle}\".",
+                'site-asset-router'
+            );
+        } else {
+            Craft::info(
+                "Routed \"{$asset->filename}\" → \"{$subPath}/\" in \"{$volume->handle}\".",
+                'site-asset-router'
+            );
+        }
+    }
+
+    /**
+     * Resolve the move/upload target folder id for the asset being saved.
+     *
+     * For a move (e.g. AssetsField enforcing a restricted location) the target
+     * lives in `newLocation` while `$asset->folderId` still points at the SOURCE,
+     * so `newLocation` must take precedence. New uploads also arrive with their
+     * target in `newLocation`/`newFolderId`. Returns null when there is no pending
+     * move (e.g. a metadata-only re-save), so such saves are a no-op.
+     */
+    private function _targetFolderId(Asset $asset): ?int
+    {
+        if ($asset->newLocation) {
+            try {
+                [$folderId] = AssetsHelper::parseFileLocation($asset->newLocation);
+                if ($folderId) {
+                    return (int)$folderId;
+                }
+            } catch (\Throwable) {
+                // Malformed newLocation — fall through to the other sources.
+            }
+        }
+
+        if ($asset->newFolderId) {
+            return (int)$asset->newFolderId;
+        }
+
+        // Body param only exists on web requests (console Request has none).
+        $request = Craft::$app->getRequest();
+        if (!$request->getIsConsoleRequest()) {
+            /** @var \craft\web\Request $request */
+            $bodyFolderId = $request->getBodyParam('folderId');
+            if ($bodyFolderId) {
+                return (int)$bodyFolderId;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Return the Site whose handle matches the first segment of a volume-folder
+     * path (e.g. "tenor/bottleShots/" → the `tenor` site), or null when the path
+     * is the volume root or its top segment isn't a site handle.
+     */
+    private function _siteFromFolderPath(?string $path): ?Site
+    {
+        $path = trim((string)$path, '/');
+        if ($path === '') {
+            return null;
+        }
+        $top = explode('/', $path)[0];
+        foreach (Craft::$app->getSites()->getAllSites() as $site) {
+            if ($site->handle === $top) {
+                return $site;
+            }
+        }
+        return null;
     }
 
     private function _registerFilterService(): void

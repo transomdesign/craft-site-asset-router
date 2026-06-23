@@ -27,6 +27,9 @@ class RoutingHandlerTest extends TestCase
     private AssetsService&MockObject $mockAssets;
     private Settings $settings;
 
+    /** @var array<int,VolumeFolder> id => folder, returned by getFolderById() */
+    private array $folders = [];
+
     protected function setUp(): void
     {
         parent::setUp();
@@ -42,6 +45,18 @@ class RoutingHandlerTest extends TestCase
 
         Craft::$app = $mockApp;
 
+        // getFolderById() resolves from the per-test $this->folders map.
+        $this->mockAssets->method('getFolderById')
+            ->willReturnCallback(fn(int $id) => $this->folders[$id] ?? null);
+
+        // Default site roster for _siteFromFolderPath() handle matching.
+        $this->mockSites->method('getAllSites')->willReturn([
+            $this->site('default'),
+            $this->site('siteA'),
+            $this->site('siteB'),
+            $this->site('tenor'),
+        ]);
+
         $this->settings = new Settings();
 
         $this->plugin = $this->createPartialMock(Plugin::class, ['getSettings']);
@@ -51,376 +66,296 @@ class RoutingHandlerTest extends TestCase
         $this->routeMethod->setAccessible(true);
     }
 
+    // ── helpers ─────────────────────────────────────────────────────────────
+
     private function invokeRoute(MockObject $asset, bool $isNew, ?Site $cpSite = null): void
     {
         $this->routeMethod->invoke($this->plugin, $asset, $isNew, $cpSite);
     }
 
-    /**
-     * ROUT-04: Re-saves (isNew=false) must not reroute the asset.
-     */
-    public function testExistingAssetNotRerouted(): void
+    private function site(string $handle): Site&MockObject
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->newLocation = null;
+        $s = $this->createMock(Site::class);
+        $s->handle = $handle;
+        return $s;
+    }
 
-        $this->invokeRoute($asset, false);
+    private function volume(string $handle): Volume&MockObject
+    {
+        $v = $this->createMock(Volume::class);
+        $v->handle = $handle;
+        return $v;
+    }
 
-        $this->assertNull($asset->newLocation, 'Re-save should not set newLocation');
+    private function folder(int $id, string $path, Volume $volume): VolumeFolder&MockObject
+    {
+        $f = $this->createMock(VolumeFolder::class);
+        $f->id = $id;
+        $f->path = $path;
+        $f->method('getVolume')->willReturn($volume);
+        $this->folders[$id] = $f;
+        return $f;
+    }
+
+    private function asset(?int $folderId, ?string $newLocation, ?int $newFolderId = null): Asset&MockObject
+    {
+        $a = $this->createMock(Asset::class);
+        $a->folderId = $folderId;
+        $a->newLocation = $newLocation;
+        $a->newFolderId = $newFolderId;
+        $a->method('getFilename')->willReturn('wine.jpg');
+        return $a;
+    }
+
+    // ── new-upload routing (original feature, new control flow) ───────────────
+
+    /**
+     * A new upload (target = volume root via newLocation, no site-prefixed source)
+     * is routed to the CP-requested site's subfolder.
+     */
+    public function testNewUploadRoutedToCpSite(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $vol = $this->volume('bottleShots');
+        $this->folder(1, '', $vol);                       // target = volume root
+        $asset = $this->asset(null, '{folder:1}wine.jpg'); // no source folder
+
+        $dest = $this->folder(42, 'siteB/bottleShots/', $vol);
+        $this->mockAssets->expects($this->once())
+            ->method('ensureFolderByFullPathAndVolume')
+            ->with('siteB/bottleShots', $vol, false)
+            ->willReturn($dest);
+
+        $this->invokeRoute($asset, true, $this->site('siteB'));
+
+        $this->assertEquals('{folder:42}wine.jpg', $asset->newLocation);
     }
 
     /**
-     * Console requests (queue jobs, CLI) must skip routing entirely.
+     * cpSite is preferred over getCurrentSite() when there's no source-site to preserve.
      */
-    public function testConsoleRequestSkipsRouting(): void
+    public function testCpSiteTakesPriorityOverCurrentSite(): void
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->newLocation = null;
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $vol = $this->volume('split');
+        $this->folder(1, '', $vol);
+        $asset = $this->asset(null, '{folder:1}wine.jpg');
 
+        $this->mockSites->expects($this->never())->method('getCurrentSite');
+        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
+            ->with('siteB/split', $vol, false)
+            ->willReturn($this->folder(77, 'siteB/split/', $vol));
+
+        $this->invokeRoute($asset, true, $this->site('siteB'));
+
+        $this->assertEquals('{folder:77}wine.jpg', $asset->newLocation);
+    }
+
+    /**
+     * Web last resort: no source-site and no cpSite → getCurrentSite().
+     */
+    public function testGetCurrentSiteFallbackWebOnly(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $vol = $this->volume('hero');
+        $this->folder(1, '', $vol);
+        $asset = $this->asset(null, '{folder:1}wine.jpg');
+
+        $this->mockSites->expects($this->once())->method('getCurrentSite')->willReturn($this->site('siteA'));
+        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
+            ->with('siteA/hero', $vol, false)
+            ->willReturn($this->folder(99, 'siteA/hero/', $vol));
+
+        $this->invokeRoute($asset, true, null);
+
+        $this->assertEquals('{folder:99}wine.jpg', $asset->newLocation);
+    }
+
+    // ── relocation re-anchoring (the bug this enhancement fixes) ──────────────
+
+    /**
+     * Core regression: an existing asset being moved to the volume root (e.g. by
+     * AssetsField restrictLocation) is re-anchored back into its source site's
+     * subfolder, even though isNew=false.
+     */
+    public function testRelocationToRootReAnchoredToSourceSite(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $vol = $this->volume('bottleShots');
+        $this->folder(10, 'tenor/bottleShots/', $vol);   // SOURCE (site-prefixed)
+        $this->folder(1, '', $vol);                        // TARGET (volume root)
+        $asset = $this->asset(10, '{folder:1}wine.jpg');
+
+        $dest = $this->folder(200, 'tenor/bottleShots/', $vol);
+        $this->mockAssets->expects($this->once())
+            ->method('ensureFolderByFullPathAndVolume')
+            ->with('tenor/bottleShots', $vol, false)
+            ->willReturn($dest);
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertEquals('{folder:200}wine.jpg', $asset->newLocation);
+    }
+
+    /**
+     * The same relocation in console/queue context (e.g. a migration resave)
+     * still re-anchors via the source site, and never consults getCurrentSite().
+     */
+    public function testConsoleRelocationPreservesSourceSite(): void
+    {
         $this->mockRequest->method('getIsConsoleRequest')->willReturn(true);
-        $this->mockRequest->expects($this->never())->method('getBodyParam');
+        $vol = $this->volume('bottleShots');
+        $this->folder(10, 'tenor/bottleShots/', $vol);
+        $this->folder(1, '', $vol);
+        $asset = $this->asset(10, '{folder:1}wine.jpg');
 
-        $this->invokeRoute($asset, true);
+        $this->mockSites->expects($this->never())->method('getCurrentSite');
+        $this->mockAssets->expects($this->once())
+            ->method('ensureFolderByFullPathAndVolume')
+            ->with('tenor/bottleShots', $vol, false)
+            ->willReturn($this->folder(200, 'tenor/bottleShots/', $vol));
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertEquals('{folder:200}wine.jpg', $asset->newLocation);
+    }
+
+    /**
+     * Console move with no resolvable site (source is the volume root, no cpSite)
+     * is a safe no-op — getCurrentSite() is gated to web requests.
+     */
+    public function testConsoleRootMoveWithNoSourceSiteNoOps(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(true);
+        $vol = $this->volume('bottleShots');
+        $this->folder(10, '', $vol);          // source = root (no site)
+        $this->folder(1, '', $vol);           // target = root
+        $asset = $this->asset(10, '{folder:1}wine.jpg');
+
+        $this->mockSites->expects($this->never())->method('getCurrentSite');
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertEquals('{folder:1}wine.jpg', $asset->newLocation, 'No site → leave the move untouched');
+    }
+
+    // ── no-op guards ──────────────────────────────────────────────────────────
+
+    /**
+     * A metadata-only re-save (no newLocation/newFolderId, no body folderId) has
+     * no move target and must be a no-op — getFolderById is never consulted.
+     */
+    public function testMetadataResaveNoOp(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $asset = $this->asset(10, null, null);
+
+        // getFolderById would only be called if a target were found.
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
 
         $this->assertNull($asset->newLocation);
     }
 
     /**
-     * ROUT-02: Site resolved from siteId body param via getSiteById().
+     * When the move target is already under a known site handle, leave it
+     * (prevents double-nesting and re-entrancy from our own rewrite).
      */
-    public function testSiteResolutionFromBodyParam(): void
+    public function testTargetAlreadySitePrefixedSkips(): void
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->method('getFilename')->willReturn('test.jpg');
-
         $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->with('siteId')->willReturn('5');
+        $vol = $this->volume('split');
+        $this->folder(50, 'siteB/split/', $vol);          // target already site-prefixed
+        $asset = $this->asset(50, '{folder:50}wine.jpg');
 
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteA';
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
 
-        $this->mockSites->expects($this->once())
-            ->method('getSiteById')
-            ->with(5)
-            ->willReturn($site);
+        $this->invokeRoute($asset, true, $this->site('siteB'));
 
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 42;
-        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->with('siteA/hero', $volume, false)
-            ->willReturn($targetFolder);
-
-        $this->invokeRoute($asset, true);
+        $this->assertEquals('{folder:50}wine.jpg', $asset->newLocation, 'Already site-prefixed → unchanged');
     }
 
     /**
-     * ROUT-02 fallback: When siteId body param is absent, use getCurrentSite().
+     * If the resolved destination equals the current target, don't rewrite
+     * newLocation (avoids a redundant move/rename).
      */
-    public function testSiteResolutionFallback(): void
+    public function testAlreadyHeadingToDestNoRewrite(): void
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->method('getFilename')->willReturn('banner.png');
-
         $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->with('siteId')->willReturn(null);
+        $vol = $this->volume('bottleShots');
+        $this->folder(10, 'tenor/bottleShots/', $vol);    // source site = tenor
+        $this->folder(1, '', $vol);                        // target = root
+        $asset = $this->asset(10, '{folder:1}wine.jpg');
 
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteB';
-
-        $this->mockSites->expects($this->once())
-            ->method('getCurrentSite')
-            ->willReturn($site);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 99;
+        // ensureFolder resolves to folder id 1 — i.e. equal to the target.
         $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->willReturn($targetFolder);
+            ->willReturn($this->folders[1]);
 
-        $this->invokeRoute($asset, true);
+        $this->invokeRoute($asset, false, null);
 
-        $this->assertEquals('{folder:99}banner.png', $asset->newLocation);
+        $this->assertEquals('{folder:1}wine.jpg', $asset->newLocation, 'dest == target → no rewrite');
     }
 
     /**
-     * CONF-01: Volumes in excludedVolumes config are skipped.
+     * CONF-01: volumes in excludedVolumes are skipped entirely.
      */
     public function testExcludedVolumeSkipsRouting(): void
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->newLocation = null;
-
         $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->with('siteId')->willReturn('1');
-
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteA';
-        $this->mockSites->method('getSiteById')->willReturn($site);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
+        $vol = $this->volume('hero');
+        $this->folder(1, '', $vol);
+        $asset = $this->asset(null, '{folder:1}wine.jpg');
 
         $this->settings->excludedVolumes = ['hero'];
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, true, $this->site('siteB'));
+
+        $this->assertEquals('{folder:1}wine.jpg', $asset->newLocation, 'Excluded volume → unchanged');
+    }
+
+    /**
+     * No resolvable move target (null folderId/newFolderId/newLocation, no body
+     * param) → routing never reaches folder resolution.
+     */
+    public function testNullTargetSkipsRouting(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $asset = $this->asset(null, null, null);
 
         $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
 
-        $this->invokeRoute($asset, true);
+        $this->invokeRoute($asset, true, $this->site('siteA'));
 
         $this->assertNull($asset->newLocation);
     }
 
     /**
-     * ROUT-01/ROUT-03: For a new upload, newLocation is set to route into the site subfolder.
+     * Target resolved from the request body folderId param (web upload path)
+     * when newLocation/newFolderId are absent.
      */
-    public function testNewLocationSetForNewUpload(): void
+    public function testTargetFromBodyFolderId(): void
     {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->method('getFilename')->willReturn('hero-shot.jpg');
-
         $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->with('siteId')->willReturn('1');
+        $this->mockRequest->method('getBodyParam')
+            ->willReturnCallback(fn(string $n) => $n === 'folderId' ? '1' : null);
 
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteA';
-        $this->mockSites->method('getSiteById')->willReturn($site);
+        $vol = $this->volume('hero');
+        $this->folder(1, '', $vol);
+        $asset = $this->asset(null, null, null);
 
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 42;
         $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->with('siteA/hero', $volume, false)
-            ->willReturn($targetFolder);
+            ->with('siteA/hero', $vol, false)
+            ->willReturn($this->folder(42, 'siteA/hero/', $vol));
 
-        $this->invokeRoute($asset, true);
+        $this->invokeRoute($asset, true, $this->site('siteA'));
 
-        $this->assertEquals('{folder:42}hero-shot.jpg', $asset->newLocation, 'newLocation should route to site/volume subfolder');
-    }
-
-    /**
-     * AUTO-01/AUTO-02: ensureFolderByFullPathAndVolume called with site handle and justRecord=false.
-     */
-    public function testEnsureFolderCalledWithSiteHandle(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->method('getFilename')->willReturn('test.jpg');
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->with('siteId')->willReturn('2');
-
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteB';
-        $this->mockSites->method('getSiteById')->willReturn($site);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 55;
-
-        $this->mockAssets->expects($this->once())
-            ->method('ensureFolderByFullPathAndVolume')
-            ->with('siteB/hero', $volume, false)
-            ->willReturn($targetFolder);
-
-        $this->invokeRoute($asset, true);
-    }
-
-    /**
-     * When asset has null folderId, null newFolderId, AND no folderId body param, routing returns early.
-     */
-    public function testNullFolderIdSkipsRouting(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = null;
-        $asset->newFolderId = null;
-        $asset->newLocation = null;
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->willReturnCallback(
-            fn(string $name) => null
-        );
-
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteA';
-        $this->mockSites->method('getCurrentSite')->willReturn($site);
-
-        $this->mockAssets->expects($this->never())->method('getFolderById');
-
-        $this->invokeRoute($asset, true);
-
-        $this->assertNull($asset->newLocation);
-    }
-
-    /**
-     * ROUT-02: cpSite (from Cp::requestedSite()) takes priority over body param and getCurrentSite().
-     */
-    public function testCpSiteTakesPriority(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 10;
-        $asset->method('getFilename')->willReturn('photo.jpg');
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'split';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->willReturn($folder);
-
-        $cpSite = $this->createMock(Site::class);
-        $cpSite->handle = 'siteB';
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 77;
-        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->with('siteB/split', $volume, false)
-            ->willReturn($targetFolder);
-
-        // Should NOT call getSiteById or getCurrentSite when cpSite is provided
-        $this->mockSites->expects($this->never())->method('getSiteById');
-        $this->mockSites->expects($this->never())->method('getCurrentSite');
-
-        $this->invokeRoute($asset, true, $cpSite);
-
-        $this->assertEquals('{folder:77}photo.jpg', $asset->newLocation);
-    }
-
-    /**
-     * When the upload already targets a site subfolder (via FilterService
-     * rewriting the asset browser source), routing must not override the location.
-     */
-    public function testUploadToSiteSubfolderSkipsRerouting(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = 50;
-        $asset->newLocation = null;
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'split';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->path = 'siteB/';
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->with(50)->willReturn($folder);
-
-        $defaultSite = $this->createMock(Site::class);
-        $defaultSite->handle = 'default';
-        $hfSite = $this->createMock(Site::class);
-        $hfSite->handle = 'siteA';
-        $hfsSite = $this->createMock(Site::class);
-        $hfsSite->handle = 'siteB';
-        $this->mockSites->method('getAllSites')->willReturn([$defaultSite, $hfSite, $hfsSite]);
-
-        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
-
-        $this->invokeRoute($asset, true);
-
-        $this->assertNull($asset->newLocation, 'Upload already in site subfolder should not be re-routed');
-    }
-
-    /**
-     * When folderId, newFolderId, and body folderId are all null (e.g. asset field
-     * uploads), resolve folder ID by parsing Asset::newLocation set by beforeSave().
-     */
-    public function testFolderIdResolvedFromNewLocation(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = null;
-        $asset->newFolderId = null;
-        $asset->newLocation = '{folder:25}photo.jpg';
-        $asset->method('getFilename')->willReturn('photo.jpg');
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->willReturnCallback(
-            fn(string $name) => null
-        );
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'cta';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->with(25)->willReturn($folder);
-
-        $cpSite = $this->createMock(Site::class);
-        $cpSite->handle = 'siteB';
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 88;
-        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->with('siteB/cta', $volume, false)
-            ->willReturn($targetFolder);
-
-        $this->invokeRoute($asset, true, $cpSite);
-
-        $this->assertEquals('{folder:88}photo.jpg', $asset->newLocation, 'Should route via newLocation parsing fallback');
-    }
-
-    /**
-     * When folderId and newFolderId are null (new upload), resolve volume from request body folderId param.
-     */
-    public function testFolderIdResolvedFromBodyParam(): void
-    {
-        $asset = $this->createMock(Asset::class);
-        $asset->folderId = null;
-        $asset->newFolderId = null;
-        $asset->method('getFilename')->willReturn('test.jpg');
-
-        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
-        $this->mockRequest->method('getBodyParam')->willReturnCallback(
-            fn(string $name) => match ($name) {
-                'siteId' => '1',
-                'folderId' => '10',
-                default => null,
-            }
-        );
-
-        $site = $this->createMock(Site::class);
-        $site->handle = 'siteA';
-        $this->mockSites->method('getSiteById')->willReturn($site);
-
-        $volume = $this->createMock(Volume::class);
-        $volume->handle = 'hero';
-        $folder = $this->createMock(VolumeFolder::class);
-        $folder->method('getVolume')->willReturn($volume);
-        $this->mockAssets->method('getFolderById')->with(10)->willReturn($folder);
-
-        $targetFolder = $this->createMock(VolumeFolder::class);
-        $targetFolder->id = 42;
-        $this->mockAssets->method('ensureFolderByFullPathAndVolume')
-            ->with('siteA/hero', $volume, false)
-            ->willReturn($targetFolder);
-
-        $this->invokeRoute($asset, true);
-
-        $this->assertEquals('{folder:42}test.jpg', $asset->newLocation, 'Should route via body param folderId fallback');
+        $this->assertEquals('{folder:42}wine.jpg', $asset->newLocation);
     }
 }

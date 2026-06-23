@@ -74,6 +74,7 @@ class FilterServiceTest extends TestCase
     {
         $volume = $this->createMock(Volume::class);
         $volume->handle = $handle;
+        $volume->id = 900 + $folderId; // non-null int — FilterService calls getRootFolderByVolumeId($volume->id)
         $folder = $this->createMock(VolumeFolder::class);
         $folder->id = $folderId;
         return [$volume, $folder];
@@ -245,11 +246,13 @@ class FilterServiceTest extends TestCase
 
         $heroVolume = $this->createMock(Volume::class);
         $heroVolume->handle = 'hero';
+        $heroVolume->id = 942;
         $heroFolder = $this->createMock(VolumeFolder::class);
         $heroFolder->id = 42;
 
         $splitVolume = $this->createMock(Volume::class);
         $splitVolume->handle = 'split';
+        $splitVolume->id = 943;
         $splitFolder = $this->createMock(VolumeFolder::class);
         $splitFolder->id = 43;
 

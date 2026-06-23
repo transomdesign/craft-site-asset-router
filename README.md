@@ -43,6 +43,21 @@ php craft plugin/install site-asset-router
 
 The plugin appears as "Site Asset Router" in the Craft CP under Settings > Plugins.
 
+## Asset field setup (required)
+
+For every **Asset field** that uploads into a routed volume, set these two options in the field's settings (Settings → Fields → your field):
+
+| Field setting | Value |
+|---|---|
+| **Restrict assets to a single location** | **On** — pointed at the volume |
+| **Allow subfolders** | **On** |
+
+That's it. The plugin then files uploads under `{siteHandle}/{volumeHandle}/` and keeps them there on every save.
+
+> ⚠️ **Never use "Restrict location: On" + "Allow subfolders: Off"** on a routed volume. Craft moves every related asset to the volume root on each entry save, which fights the plugin and scatters files. (The plugin will fight back and re-anchor them, but only at the cost of a move on every save — so just turn subfolders on.)
+
+**Don't want to restrict the field to one volume?** Then leave **"Restrict assets to a single location" Off** — the plugin still routes uploads to the correct `{site}/{volume}/` folder. Either of these is fine; the broken combo above is the only one to avoid.
+
 ## Configuration
 
 Create or edit `config/site-asset-router.php`:
@@ -92,16 +107,27 @@ The plugin listens to `Asset::EVENT_REGISTER_SOURCES` and rewrites volume source
 
 Clicking "Images" in the asset sidebar shows only `brandA/images/` contents when Brand A is the active site. Switching sites in the CP header updates the view automatically.
 
+### Relocation re-anchoring (existing assets)
+
+Routing is driven by the **move target**, not by whether the asset is new. Whenever a save would land an asset at a *non* site-prefixed folder (typically the volume root), the router re-anchors it to `{siteHandle}/{volumeHandle}/`. The destination site is resolved in this order:
+
+1. **Source-site preservation** — if the asset already lives under `{site}/…`, it is kept in that site's subfolder. This needs no request context, so it works in **console / queue / migration** runs.
+2. **CP-requested site** — for new uploads from an entry editor or the asset browser.
+3. **`getCurrentSite()`** — web requests only (a queue/console move is never misfiled into the primary site).
+
+This is what makes the router survive Craft's own asset moves — most notably an Assets field with `restrictLocation: true` (see below), which calls `moveAsset()` to the restricted upload folder on every canonical entry save.
+
 ### Safety guards
 
 | Scenario | Behavior |
 |----------|----------|
-| Console / CLI commands | Routing skipped (no site context) |
-| Queue jobs | Routing skipped (console request) |
-| Re-saving existing assets | Routing skipped (`isNew = false`) |
+| Metadata-only re-save (no move) | No-op (no target folder) |
+| Move/upload to an already site-prefixed folder | No-op (left as-is; prevents double-nesting) |
+| Console / queue move of a site-foldered asset | Re-anchored to the asset's **source** site |
+| Console / queue move with no resolvable site | No-op (left as-is) |
+| New upload (web) | Routed to the CP/current site |
 | Excluded volumes | Routing and filtering both skipped |
 | Settings context (volume config screens) | Filtering skipped |
-| Null site (no CP context) | Routing and filtering both skipped |
 
 ## Asset field configuration
 
@@ -110,6 +136,10 @@ Once the plugin is active, you can **remove** any manual `{ object.site.handle }
 - Drag-and-drop into the asset browser
 - The "Upload files" button in the asset browser
 - Upload buttons on asset fields in entry editors
+
+### Why "Allow subfolders" must be on
+
+See [Asset field setup](#asset-field-setup-required) for the required settings. The reason: with `restrictLocation: true` + `allowSubfolders: false`, Craft's `Assets::afterElementSave()` calls `moveAsset()` to drag every related asset into the field's restricted upload folder (the volume root) on each canonical save — overriding this plugin's per-site placement. `allowSubfolders: true` makes Craft treat assets already under the volume's site subfolders as valid and leave them alone. The relocation re-anchoring above is the safety net if a field is misconfigured, but it costs a move on every save, so the config should be correct.
 
 ## Logging
 
@@ -130,8 +160,8 @@ php ../../vendor/bin/phpunit
 
 ## Known limitations
 
-- **CLI uploads are not routed.** Assets created via console commands or queue jobs bypass routing because there is no CP site context. These assets land wherever Craft's default logic places them.
-- **Existing assets are not migrated.** Installing the plugin does not move previously uploaded assets into site subfolders. Only new uploads are routed.
+- **Brand-new CLI/queue uploads with no site context are not routed.** An asset *created* from scratch in a console command or queue job has no source-site folder and no CP request, so it lands wherever Craft's default logic places it. (Console *relocations* of assets that already live under a site subfolder **are** re-anchored — see "Relocation re-anchoring".)
+- **Installing the plugin does not retroactively move existing assets.** It routes/re-anchors assets as they are saved or moved; it does not sweep the volume on install. Use `resave/entries` (or a one-off move) to migrate a back-catalogue.
 - **No per-field routing.** All non-excluded volumes use the same `{siteHandle}/{volumeHandle}/` pattern. There is no way to configure different subfolder structures per field.
 
 ## File structure
