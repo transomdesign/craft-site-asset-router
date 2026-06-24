@@ -59,7 +59,9 @@ class RoutingHandlerTest extends TestCase
 
         $this->settings = new Settings();
 
-        $this->plugin = $this->createPartialMock(Plugin::class, ['getSettings']);
+        // _relationSiteIds is the DB-touching seam for the stranded-root guard;
+        // mock it so tests can drive site resolution without a database.
+        $this->plugin = $this->createPartialMock(Plugin::class, ['getSettings', '_relationSiteIds']);
         $this->plugin->method('getSettings')->willReturn($this->settings);
 
         $this->routeMethod = new \ReflectionMethod(Plugin::class, '_routeAssetUpload');
@@ -73,11 +75,24 @@ class RoutingHandlerTest extends TestCase
         $this->routeMethod->invoke($this->plugin, $asset, $isNew, $cpSite);
     }
 
-    private function site(string $handle): Site&MockObject
+    private function site(string $handle, ?int $id = null): Site&MockObject
     {
         $s = $this->createMock(Site::class);
+        $s->id = $id;
         $s->handle = $handle;
         return $s;
+    }
+
+    /**
+     * Stub Sites::getSiteById() from an id => Site map, for relation-driven
+     * site resolution in the stranded-root guard.
+     *
+     * @param array<int,Site> $byId
+     */
+    private function sitesById(array $byId): void
+    {
+        $this->mockSites->method('getSiteById')
+            ->willReturnCallback(fn(int $id) => $byId[$id] ?? null);
     }
 
     private function volume(string $handle): Volume&MockObject
@@ -97,12 +112,14 @@ class RoutingHandlerTest extends TestCase
         return $f;
     }
 
-    private function asset(?int $folderId, ?string $newLocation, ?int $newFolderId = null): Asset&MockObject
+    private function asset(?int $folderId, ?string $newLocation, ?int $newFolderId = null, ?string $tempFilePath = null): Asset&MockObject
     {
         $a = $this->createMock(Asset::class);
+        $a->id = 8956;
         $a->folderId = $folderId;
         $a->newLocation = $newLocation;
         $a->newFolderId = $newFolderId;
+        $a->tempFilePath = $tempFilePath;
         $a->method('getFilename')->willReturn('wine.jpg');
         return $a;
     }
@@ -357,5 +374,139 @@ class RoutingHandlerTest extends TestCase
         $this->invokeRoute($asset, true, $this->site('siteA'));
 
         $this->assertEquals('{folder:42}wine.jpg', $asset->newLocation);
+    }
+
+    // ── stranded-root guard (CP "replace" lands a file in the volume root) ────
+
+    /**
+     * A replace (tempFilePath set, no move target) of an asset stranded in the
+     * volume root is re-homed to its owning site's subfolder, with the site
+     * resolved from the asset's relations — not the (absent) request context.
+     */
+    public function testReplaceInRootReHomedViaRelations(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('heroHome');
+        $this->folder(42, '', $vol);                              // asset sits in the bare root
+        $asset = $this->asset(42, null, null, '/tmp/upload.jpg'); // replace: tempFilePath set, no target
+
+        $this->plugin->method('_relationSiteIds')->willReturn([1]);
+        $this->sitesById([1 => $this->site('matthews', 1)]);
+
+        $this->mockAssets->expects($this->once())
+            ->method('ensureFolderByFullPathAndVolume')
+            ->with('matthews/heroHome', $vol, false)
+            ->willReturn($this->folder(44, 'matthews/heroHome/', $vol));
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertEquals('{folder:44}wine.jpg', $asset->newLocation);
+    }
+
+    /**
+     * Relations spanning more than one site are ambiguous → leave the asset put
+     * rather than risk filing it under the wrong site.
+     */
+    public function testReplaceInRootAmbiguousRelationsNoOp(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('heroHome');
+        $this->folder(42, '', $vol);
+        $asset = $this->asset(42, null, null, '/tmp/upload.jpg');
+
+        $this->plugin->method('_relationSiteIds')->willReturn([1, 4]);
+        $this->sitesById([1 => $this->site('matthews', 1), 4 => $this->site('tenor', 4)]);
+
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertNull($asset->newLocation, 'Ambiguous owning site → unchanged');
+    }
+
+    /**
+     * No relations at all → unresolvable site → safe no-op.
+     */
+    public function testReplaceInRootNoRelationsNoOp(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('heroHome');
+        $this->folder(42, '', $vol);
+        $asset = $this->asset(42, null, null, '/tmp/upload.jpg');
+
+        $this->plugin->method('_relationSiteIds')->willReturn([]);
+
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertNull($asset->newLocation, 'No relations → unchanged');
+    }
+
+    /**
+     * A replace of a correctly-located asset (already in a site subfolder) is the
+     * common case and must be untouched — the guard only acts on the bare root.
+     */
+    public function testReplaceInSubfolderNoOp(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('heroHome');
+        $this->folder(44, 'matthews/heroHome/', $vol);            // already correctly located
+        $asset = $this->asset(44, null, null, '/tmp/upload.jpg');
+
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertNull($asset->newLocation, 'Already in a subfolder → unchanged');
+    }
+
+    /**
+     * A replace in an excluded volume's root is left alone (CONF-01).
+     */
+    public function testReplaceInExcludedVolumeRootNoOp(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('icons');
+        $this->folder(42, '', $vol);
+        $asset = $this->asset(42, null, null, '/tmp/upload.jpg');
+
+        $this->settings->excludedVolumes = ['icons'];
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertNull($asset->newLocation, 'Excluded volume → unchanged');
+    }
+
+    /**
+     * A metadata-only re-save of a root asset (no tempFilePath) must NOT trigger
+     * the guard — relations are never consulted and nothing is rewritten.
+     */
+    public function testMetadataResaveInRootDoesNotConsultRelations(): void
+    {
+        $this->mockRequest->method('getIsConsoleRequest')->willReturn(false);
+        $this->mockRequest->method('getBodyParam')->willReturn(null);
+
+        $vol = $this->volume('heroHome');
+        $this->folder(42, '', $vol);
+        $asset = $this->asset(42, null, null, null);   // no tempFilePath → not a file-bearing save
+
+        $this->plugin->expects($this->never())->method('_relationSiteIds');
+        $this->mockAssets->expects($this->never())->method('ensureFolderByFullPathAndVolume');
+
+        $this->invokeRoute($asset, false, null);
+
+        $this->assertNull($asset->newLocation);
     }
 }
