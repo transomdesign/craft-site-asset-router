@@ -117,6 +117,12 @@ Routing is driven by the **move target**, not by whether the asset is new. Whene
 
 This is what makes the router survive Craft's own asset moves — most notably an Assets field with `restrictLocation: true` (see below), which calls `moveAsset()` to the restricted upload folder on every canonical entry save.
 
+### Stranded-root guard (CP "replace file")
+
+A CP **"Replace file"** fires `Asset::EVENT_BEFORE_SAVE` with a new file (`tempFilePath`) but **no move target** — Craft just rewrites the file at the asset's existing folder. For a correctly-located asset that's fine (it stays in its site subfolder). But an asset already stranded in the **bare volume root** would have its replacement written to the root too, since the regular routing above only acts on a move.
+
+The router catches this: on a file-bearing save with no move target whose asset sits in a non-excluded volume's root, it re-anchors the asset to `{siteHandle}/{volumeHandle}/`. A replace request carries **no site context** (`Cp::requestedSite()` would fall back to the primary site), so the destination site is resolved from the asset's **relations** — the distinct sites of the elements that reference it (relations with a null `sourceSiteId` are expanded via `elements_sites`). If that's unresolvable or spans more than one site, the asset is **left in place and a warning is logged** rather than risk filing it under the wrong site.
+
 ### Safety guards
 
 | Scenario | Behavior |
@@ -125,6 +131,8 @@ This is what makes the router survive Craft's own asset moves — most notably a
 | Move/upload to an already site-prefixed folder | No-op (left as-is; prevents double-nesting) |
 | Console / queue move of a site-foldered asset | Re-anchored to the asset's **source** site |
 | Console / queue move with no resolvable site | No-op (left as-is) |
+| Replace file on an asset stranded in the volume root | Re-anchored to the relation-derived site; no-op + warning if unresolvable/ambiguous |
+| Replace file on a correctly-located asset | No-op (already site-prefixed; stays put) |
 | New upload (web) | Routed to the CP/current site |
 | Excluded volumes | Routing and filtering both skipped |
 | Settings context (volume config screens) | Filtering skipped |

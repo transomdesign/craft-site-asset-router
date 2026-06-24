@@ -7,6 +7,8 @@ namespace SiteAssetRouter;
 use Craft;
 use craft\base\Model;
 use craft\base\Plugin as BasePlugin;
+use craft\db\Query;
+use craft\db\Table;
 use craft\elements\Asset;
 use craft\events\ModelEvent;
 use craft\models\Site;
@@ -116,9 +118,12 @@ class Plugin extends BasePlugin
         $request = Craft::$app->getRequest();
         $assetsService = Craft::$app->getAssets();
 
-        // Determine the TARGET folder of this save. No target => not a move => no-op.
+        // Determine the TARGET folder of this save. No target => not a move, but a
+        // file-bearing save (a CP "replace") can still strand a file in the volume
+        // root, so hand off to the stranded-root guard before bailing.
         $targetFolderId = $this->_targetFolderId($asset);
         if (!$targetFolderId) {
+            $this->_rehomeStrandedRootAsset($asset);
             return;
         }
 
@@ -228,6 +233,149 @@ class Plugin extends BasePlugin
         }
 
         return null;
+    }
+
+    /**
+     * Re-home an asset that a file-bearing save would otherwise leave stranded in
+     * a non-excluded volume's root folder.
+     *
+     * A CP "replace" fires Asset::EVENT_BEFORE_SAVE with no move target (no
+     * newLocation/newFolderId), so the regular routing in _routeAssetUpload() is a
+     * no-op and the new file is written to whatever folder the record already
+     * points at. When that's the bare volume root the file lands at the top of the
+     * filesystem instead of its `{site}/{volume}/` subfolder. The replace request
+     * carries no site context (Cp::requestedSite() would fall back to the primary
+     * site), so the destination site is resolved from the asset's relations; when
+     * that's unresolvable or spans multiple sites the asset is left untouched and a
+     * warning is logged rather than risk filing it under the wrong site.
+     */
+    private function _rehomeStrandedRootAsset(Asset $asset): void
+    {
+        // Only a save that writes a file (replace/create) can strand one in the
+        // root; a metadata-only re-save must stay a no-op.
+        if ($asset->tempFilePath === null || !$asset->folderId) {
+            return;
+        }
+
+        $assetsService = Craft::$app->getAssets();
+        $folder = $assetsService->getFolderById($asset->folderId);
+        if (!$folder) {
+            return;
+        }
+
+        $volume = $folder->getVolume();
+        if (!$volume) {
+            return;
+        }
+
+        // CONF-01: Volume exclusion check
+        /** @var Settings $settings */
+        $settings = $this->getSettings();
+        if (in_array($volume->handle, $settings->excludedVolumes, true)) {
+            return;
+        }
+
+        // Only act on the bare volume root — an asset already in any subfolder
+        // (site-prefixed or otherwise) is left exactly where it is.
+        if (trim((string)$folder->path, '/') !== '') {
+            return;
+        }
+
+        $filename = $asset->getFilename();
+
+        $site = $this->_siteFromRelations($asset);
+        if ($site === null) {
+            Craft::warning(
+                "Could not re-home stranded \"{$filename}\" in \"{$volume->handle}\": no single owning " .
+                'site resolvable from its relations — left in the volume root.',
+                'site-asset-router'
+            );
+            return;
+        }
+
+        $subPath = $site->handle . '/' . $volume->handle;
+        $destFolder = $assetsService->ensureFolderByFullPathAndVolume($subPath, $volume, false);
+
+        // Already at the root we'd route into (shouldn't happen for a real site
+        // subfolder, but guards against a redundant rewrite).
+        if ($destFolder->id === $asset->folderId) {
+            return;
+        }
+
+        $asset->newLocation = "{folder:{$destFolder->id}}{$filename}";
+
+        Craft::info(
+            "Re-homed stranded \"{$filename}\" from the \"{$volume->handle}\" volume root → \"{$subPath}/\".",
+            'site-asset-router'
+        );
+    }
+
+    /**
+     * Resolve the single Site that owns an asset, derived from the elements that
+     * relate to it. Returns null when there are no relations or they span more
+     * than one site (ambiguous) — used to re-home a root-stranded asset where the
+     * request itself carries no site context.
+     */
+    private function _siteFromRelations(Asset $asset): ?Site
+    {
+        $sitesService = Craft::$app->getSites();
+
+        $sites = [];
+        foreach ($this->_relationSiteIds((int)$asset->id) as $siteId) {
+            $site = $sitesService->getSiteById($siteId);
+            if ($site) {
+                $sites[$site->id] = $site;
+            }
+        }
+
+        return count($sites) === 1 ? reset($sites) : null;
+    }
+
+    /**
+     * Distinct site IDs of the elements that relate to the given asset.
+     *
+     * Relations with a NULL sourceSiteId (a non-localized relation field applies
+     * to every site) are expanded to the site IDs their source element actually
+     * exists on, via elements_sites.
+     *
+     * @return int[]
+     */
+    protected function _relationSiteIds(int $assetId): array
+    {
+        $rows = (new Query())
+            ->select(['sourceId', 'sourceSiteId'])
+            ->distinct()
+            ->from(Table::RELATIONS)
+            ->where(['targetId' => $assetId])
+            ->all();
+
+        if (!$rows) {
+            return [];
+        }
+
+        $siteIds = [];
+        $unscopedSourceIds = [];
+        foreach ($rows as $row) {
+            if ($row['sourceSiteId'] !== null) {
+                $siteIds[(int)$row['sourceSiteId']] = true;
+            } else {
+                $unscopedSourceIds[] = (int)$row['sourceId'];
+            }
+        }
+
+        if ($unscopedSourceIds) {
+            $expanded = (new Query())
+                ->select(['siteId'])
+                ->distinct()
+                ->from(Table::ELEMENTS_SITES)
+                ->where(['elementId' => array_unique($unscopedSourceIds)])
+                ->column();
+            foreach ($expanded as $siteId) {
+                $siteIds[(int)$siteId] = true;
+            }
+        }
+
+        return array_keys($siteIds);
     }
 
     /**
