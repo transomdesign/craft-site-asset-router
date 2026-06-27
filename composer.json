@@ -1,5 +1,5 @@
 {
-    "name": "transomdesign/craft-site-asset-router",
+    "name": "transom/craft-site-asset-router",
     "description": "Routes asset uploads to site-specific subfolders in Craft CMS multisite installations",
     "type": "craft-plugin",
     "license": "MIT",
